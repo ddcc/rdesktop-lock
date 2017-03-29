@@ -4,12 +4,10 @@
 #include <Windows.h>
 #include <shellapi.h>
 #include <WtsApi32.h>
-#include <Dbt.h>
 #include <objbase.h>
 
 #include <stdlib.h>
 #include <malloc.h>
-#include <memory.h>
 #include <tchar.h>
 
 #include "rdesktop-lock.h"
@@ -17,6 +15,7 @@
 #define MAX_STRING				64
 #define WMAPP_NOTIFYCALLBACK	(WM_APP + 1)
 #define TIMER_ID				0
+#define RETRY_COUNT				10
 
 // Use different GUID between builds to avoid ERROR_NO_TOKEN
 #ifdef NDEBUG
@@ -33,17 +32,35 @@ TCHAR g_szTitle[MAX_STRING];
 TCHAR g_szWindowClass[MAX_STRING];
 
 // Functions
-void ErrorHandler(HWND hWnd, BOOL bReturn) {
-	if (!bReturn) {
+BOOL ErrorHandler(HWND hWnd, BOOL bReturn) {
+	UINT uError = GetLastError();
+	if (!bReturn && uError != ERROR_SUCCESS) {
 		TCHAR *Buffer;
-		UINT uError = GetLastError();
-		if ((bReturn = FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM, NULL, uError, 0, (LPTSTR) &Buffer, 0, NULL))) {
+		if ((bReturn = FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM, NULL, uError, 0, (LPTSTR)&Buffer, 0, NULL))) {
 			bReturn = MessageBox(hWnd, Buffer, NULL, MB_OK | MB_ICONSTOP | MB_SYSTEMMODAL | MB_SETFOREGROUND);
 			LocalFree(Buffer);
 		}
 
 		PostQuitMessage(uError);
 	}
+
+	return bReturn;
+}
+
+BOOL ErrorRepostHandler(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam, BOOL bReturn) {
+	static DWORD dwCount = 0;
+	// If a timeout occurred, try to repost the message, up to the retry count
+	if (!bReturn && GetLastError() == ERROR_TIMEOUT && dwCount++ < RETRY_COUNT) {
+		if (dwCount++ < RETRY_COUNT) {
+			return ErrorHandler(hWnd, PostMessage(hWnd, Msg, wParam, lParam));
+		} else {
+			return ErrorHandler(hWnd, FALSE);
+		}
+	} else if (bReturn) {
+		dwCount = 0;
+	}
+
+	return bReturn;
 }
 
 BOOL IsScreenSaverEnabled(BOOL *bIsEnabled) {
@@ -89,7 +106,7 @@ BOOL SendMouseInput() {
 
 BOOL EnableTimeoutPrevention(HWND hWnd, UINT eInput) {
 	BOOL bIsScreenSaverActive;
-	UINT uTimeout;
+	INT uTimeout;
 
 	if (!IsScreenSaverEnabled(&bIsScreenSaverActive))
 		return FALSE;
@@ -105,7 +122,7 @@ BOOL RunTimeoutPrevention(UINT eInput) {
 	case IDM_OPTIONS_MOUSE:
 		return SendMouseInput();
 	case IDM_OPTIONS_SCREENSAVERTIMEOUT: {
-		UINT uTimeout;
+		INT uTimeout;
 		return GetScreenSaverTimeout(&uTimeout) && SetScreenSaverTimeout(uTimeout);
 	}
 	default:
@@ -155,6 +172,7 @@ BOOL ChangeNotificationIcon(enum ConnectionType eType) {
 		.guidItem = APPLICATION_GUID,
 	};
 
+
 	switch (eType) {
 	case None:
 		IconData.hIcon = LoadIcon(g_hInstance, MAKEINTRESOURCE(IDI_ICON));
@@ -192,7 +210,8 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
 	switch (message) {
 	case WM_INITDIALOG: {
 		TCHAR FileName[MAX_PATH + 1] = { 0 };
-		SIZE_T szVersionInfo, szName, szVersion;
+		DWORD szVersionInfo;
+		UINT szName, szVersion;
 		VOID *VersionInfo, *Name, *Version;
 
 		ErrorHandler(hDlg, GetModuleFileName(NULL, FileName, MAX_PATH));
@@ -213,12 +232,10 @@ INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPara
 		EndDialog(hDlg, 0);
 		return (INT_PTR) TRUE;
 	case WM_COMMAND:
-		switch (LOWORD(wParam)) {
-		case IDOK:
+		if (LOWORD(wParam) == IDOK) {
 			EndDialog(hDlg, 0);
 			return (INT_PTR) TRUE;
 		}
-		return (INT_PTR) FALSE;
 	default:
 		return (INT_PTR) FALSE;
 	}
@@ -269,7 +286,7 @@ BOOL HandleContextMenuSelection(HWND hWnd, BOOL bIsRemote, UINT *eInput, UINT uI
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT nMessage, WPARAM wParam, LPARAM lParam) {
-	BOOL bIsRemote = FALSE;
+	static BOOL bIsRemote = FALSE;
 	static UINT WM_TASKBAR_CREATED = 0;
 	static UINT eInput = IDM_OPTIONS_SCREENSAVERTIMEOUT;
 
@@ -300,7 +317,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT nMessage, WPARAM wParam, LPARAM lParam)
 
 		// Check if currently remote
 		ErrorHandler(hWnd, IsCurrentSessionRemote(&bIsRemote));
-		ErrorHandler(hWnd, ChangeNotificationIcon(bIsRemote ? Remote : Local));
+		ErrorRepostHandler(hWnd, nMessage, wParam, lParam, ChangeNotificationIcon(bIsRemote ? Remote : Local));
 		ErrorHandler(hWnd, HandleContextMenuSelection(hWnd, bIsRemote, &eInput, IDM_OPTIONS_SCREENSAVERTIMEOUT));
 		return 0;
 	case WM_COMMAND:
@@ -328,32 +345,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT nMessage, WPARAM wParam, LPARAM lParam)
 	case WM_WTSSESSION_CHANGE:
 		switch (LOWORD(wParam)) {
 			case WTS_CONSOLE_CONNECT:
-				OutputDebugString(_T("WTS_CONSOLE_CONNECT\n"));
 				bIsRemote = FALSE;
-				ErrorHandler(hWnd, ChangeNotificationIcon(Local));
+				ErrorRepostHandler(hWnd, nMessage, wParam, lParam, ChangeNotificationIcon(Local));
 				return 0;
 			case WTS_CONSOLE_DISCONNECT:
-				OutputDebugString(_T("WTS_CONSOLE_DISCONNECT\n"));
-				ErrorHandler(hWnd, ChangeNotificationIcon(None));
+				ErrorRepostHandler(hWnd, nMessage, wParam, lParam, ChangeNotificationIcon(None));
 				return 0;
 			case WTS_REMOTE_CONNECT:
 				bIsRemote = TRUE;
-				OutputDebugString(_T("WTS_REMOTE_CONNECT\n"));
 				ErrorHandler(hWnd, EnableTimeoutPrevention(hWnd, eInput));
-				ErrorHandler(hWnd, ChangeNotificationIcon(Remote));
+				ErrorRepostHandler(hWnd, nMessage, wParam, lParam, ChangeNotificationIcon(Remote));
 				return 0;
 			case WTS_REMOTE_DISCONNECT:
 				bIsRemote = FALSE;
-				OutputDebugString(_T("WTS_REMOTE_DISCONNECT\n"));
 				ErrorHandler(hWnd, DisableTimeoutPrevention(hWnd, eInput));
-				ErrorHandler(hWnd, ChangeNotificationIcon(None));
+				ErrorRepostHandler(hWnd, nMessage, wParam, lParam, ChangeNotificationIcon(None));
 				return 0;
 			default:
 				return 0;
 		}
 	case WM_TIMER:
-		switch (wParam) {
-		case TIMER_ID:
+		if (wParam == TIMER_ID) {
 			ErrorHandler(hWnd, RunTimeoutPrevention(eInput));
 			return 0;
 		}
@@ -361,7 +373,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT nMessage, WPARAM wParam, LPARAM lParam)
 		// Check if taskbar notification icon needs to be re-created
 		if (nMessage == WM_TASKBAR_CREATED) {
 			ErrorHandler(hWnd, AddNotificationIcon(hWnd));
-			ErrorHandler(hWnd, ChangeNotificationIcon(bIsRemote ? Remote : Local));
+			ErrorRepostHandler(hWnd, nMessage, wParam, lParam, ChangeNotificationIcon(bIsRemote ? Remote : Local));
 			return 0;
 		}
 
@@ -412,7 +424,7 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hWindowInstance, _In_opt_ HINSTANCE hPrevI
 	ErrorHandler(NULL, InitInstance(nCmdShow));
 
 	MSG msg;
-	while (GetMessage(&msg, NULL, 0, 0)) {
+	while (ErrorHandler(NULL, (BOOL) (GetMessage(&msg, NULL, 0, 0) != 0))) {
 		TranslateMessage(&msg);
 		DispatchMessage(&msg);
 	}
