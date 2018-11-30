@@ -372,7 +372,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT nMessage, WPARAM wParam, LPARAM lParam)
 	default:
 		// Check if taskbar notification icon needs to be re-created
 		if (nMessage == WM_TASKBAR_CREATED) {
-			ErrorHandler(hWnd, AddNotificationIcon(hWnd));
+			// Ignore error, may already exist
+			AddNotificationIcon(hWnd);
 			ErrorRepostHandler(hWnd, nMessage, wParam, lParam, ChangeNotificationIcon(bIsRemote ? Remote : Local));
 			return 0;
 		}
