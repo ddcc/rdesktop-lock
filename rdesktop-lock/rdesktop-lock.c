@@ -6,7 +6,6 @@
 #include <WtsApi32.h>
 #include <objbase.h>
 
-#include <stdlib.h>
 #include <malloc.h>
 #include <tchar.h>
 
@@ -366,7 +365,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT nMessage, WPARAM wParam, LPARAM lParam)
 		}
 	case WM_TIMER:
 		if (wParam == TIMER_ID) {
-			ErrorHandler(hWnd, RunTimeoutPrevention(eInput));
+			BOOL hResult = RunTimeoutPrevention(eInput);
+			if (!hResult && GetLastError() != ERROR_OPERATION_IN_PROGRESS)
+				ErrorHandler(hWnd, hResult);
 			return 0;
 		}
 	default:
